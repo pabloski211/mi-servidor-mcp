@@ -1,10 +1,34 @@
-from mcp.server.fastmcp import FastMCP
+
 from mock_confluence_service import pages
 import os
+from mcp.server.fastmcp import FastMCP
+from fastapi.middleware.cors import CORSMiddleware
+
 
 PORT=os.environ.get("PORT", 8000)
 mcp = FastMCP("MCP DOCUMENTAL",host="0.0.0.0", port=PORT)
 
+import os
+
+# --- Configuración del Servidor ---
+PORT = os.environ.get("PORT", 8000)
+
+# 1. Configuración del título, versión y descripción directamente en FastMCP
+mcp = FastMCP(
+    "HR MCP Server",  # Este será el nombre/título
+    host="0.0.0.0",
+    port=PORT
+)
+
+# 2. Añadir Middleware CORS a la aplicación FastAPI subyacente
+# FastMCP expone la aplicación de FastAPI a través del atributo `.app`
+mcp.app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Asumimos que 'mcp' es un módulo o objeto disponible en tu entorno,
 # similar al ejemplo que proporcionaste.
