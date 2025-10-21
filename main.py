@@ -1,126 +1,85 @@
-import os
-import threading
-import asyncio
-from typing import Dict, Any, Optional
-
-from fastmcp import FastMCP   # tus tools aquí
+# server_proxy_stateless.py  (ASGI proxy + auto initialize)
+import os, threading, json
+from fastmcp import FastMCP
 import httpx
 from starlette.applications import Starlette
-from starlette.responses import Response, JSONResponse, StreamingResponse, PlainTextResponse
+from starlette.responses import Response, StreamingResponse
 from starlette.requests import Request
 from starlette.routing import Route
 
-# ---------- CONFIG ----------
 INNER_HOST = "127.0.0.1"
-INNER_PORT = int(os.getenv("INNER_PORT", "9000"))  # FastMCP interno
-PUBLIC_PORT = int(os.getenv("PORT", "8000"))       # UVicorn/Render
+INNER_PORT = int(os.getenv("INNER_PORT", "9000"))
+PUBLIC_PORT = int(os.getenv("PORT", "8000"))
 
-CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
-CORS_ALLOW_HEADERS = os.getenv("CORS_ALLOW_HEADERS", "Content-Type, Accept, x-api-key")
-CORS_ALLOW_METHODS = os.getenv("CORS_ALLOW_METHODS", "GET, POST, OPTIONS")
-CORS_MAX_AGE = "86400"
-
-# ---------- MCP (nativo) ----------
 mcp = FastMCP("HR MCP Server")
 
 @mcp.tool
-def ping(message: str) -> Dict[str, Any]:
-    """Simple health check."""
-    return {"ok": True, "message": message}
+def ping(message: str): return {"ok": True, "message": message}
 
-@mcp.tool
-def search_candidates(term: str = "") -> Dict[str, Any]:
-    """Search candidates by term."""
-    return {"results": [], "term": term}
-
-def run_inner_fastmcp():
-    # Levanta FastMCP nativo en loopback, puerto interno
+def run_inner():
     mcp.run(transport="http", host=INNER_HOST, port=INNER_PORT, path="/")
+threading.Thread(target=run_inner, daemon=True).start()
 
-# Arrancamos el FastMCP nativo en un hilo aparte
-threading.Thread(target=run_inner_fastmcp, daemon=True).start()
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": os.getenv("CORS_ALLOW_ORIGINS","*"),
+        "Access-Control-Allow-Methods": os.getenv("CORS_ALLOW_METHODS","GET, POST, OPTIONS"),
+        "Access-Control-Allow-Headers": os.getenv("CORS_ALLOW_HEADERS","Content-Type, Accept, x-api-key, x-session-id"),
+        "Access-Control-Max-Age": "86400",
+    }
 
-# ---------- ASGI proxy con CORS + OPTIONS ----------
 async def preflight(_: Request):
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": CORS_ALLOW_ORIGINS,
-        "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
-        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
-        "Access-Control-Max-Age": CORS_MAX_AGE,
-    })
-
-def add_cors_headers(resp: Response) -> Response:
-    resp.headers.setdefault("Access-Control-Allow-Origin", CORS_ALLOW_ORIGINS)
-    resp.headers.setdefault("Vary", "Origin")
-    return resp
+    return Response(status_code=204, headers=cors_headers())
 
 async def proxy_post_root(request: Request):
-    # Reenvía el JSON-RPC al FastMCP interno
     body = await request.body()
-    headers = {
-        "Content-Type": "application/json",
-        # Respeta lo tiquismiquis del servidor interno:
-        "Accept": request.headers.get("accept", "application/json, text/event-stream"),
-    }
-    # Reenvía también x-api-key / cookies si las hay
-    if "x-api-key" in request.headers:
-        headers["x-api-key"] = request.headers["x-api-key"]
-    cookies = request.headers.get("cookie")
+    headers = {"Content-Type":"application/json","Accept":"application/json, text/event-stream"}
+    if "x-api-key" in request.headers: headers["x-api-key"] = request.headers["x-api-key"]
+    session_id = request.headers.get("x-session-id")
+    cookies_hdr = request.headers.get("cookie")
 
     async with httpx.AsyncClient(timeout=None) as client:
+        # 1) Si no hay cookie ni x-session-id → auto-initialize
+        set_cookie = None
+        if not cookies_hdr and not session_id:
+            init_body = {
+                "jsonrpc":"2.0","id":"init-auto","method":"initialize",
+                "params":{"protocolVersion":"1.0","clientInfo":{"name":"proxy","version":"1.0"},"capabilities":{"tools":{"listChanged":True}}}
+            }
+            r0 = await client.post(f"http://{INNER_HOST}:{INNER_PORT}/", json=init_body, headers=headers)
+            set_cookie = r0.headers.get("set-cookie")
+
+        # 2) Ejecutar la request original contra el inner server
         r = await client.post(
             f"http://{INNER_HOST}:{INNER_PORT}/",
-            content=body,
-            headers=headers,
-            cookies={} if not cookies else {c.split("=")[0].strip(): "=".join(c.split("=")[1:]) for c in cookies.split(";")}
+            content=body, headers=headers,
+            cookies=None  # usamos Set-Cookie del paso 1 si lo hubo
         )
-        # Passthrough JSON y cookies de sesión
-        resp = Response(
-            content=r.content,
-            status_code=r.status_code,
-            media_type=r.headers.get("content-type", "application/json")
-        )
-        if "set-cookie" in r.headers:
-            resp.headers["set-cookie"] = r.headers["set-cookie"]
-        return add_cors_headers(resp)
+
+        # 3) Responder al cliente + CORS + sesión opcional
+        resp = Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type","application/json"))
+        h = cors_headers()
+        for k,v in h.items(): resp.headers.setdefault(k,v)
+        # si el inner nos dio cookie en init, pásala al cliente
+        if set_cookie: resp.headers["set-cookie"] = set_cookie
+        # opcional: proxyear un x-session-id sintético
+        return resp
 
 async def proxy_sse(request: Request):
-    # Reenvía SSE manteniendo stream abierto
-    headers = {
-        "Accept": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-    }
-    if "x-api-key" in request.headers:
-        headers["x-api-key"] = request.headers["x-api-key"]
-    cookies = request.headers.get("cookie")
-
-    async def eventgen():
+    headers = {"Accept":"text/event-stream","Cache-Control":"no-cache","Connection":"keep-alive"}
+    async def gen():
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "GET", f"http://{INNER_HOST}:{INNER_PORT}/sse",
-                headers=headers,
-                cookies={} if not cookies else {c.split("=")[0].strip(): "=".join(c.split("=")[1:]) for c in cookies.split(";")}
-            ) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
+            async with client.stream("GET", f"http://{INNER_HOST}:{INNER_PORT}/sse", headers=headers) as r:
+                async for chunk in r.aiter_bytes(): yield chunk
+    resp = StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"})
+    for k,v in cors_headers().items(): resp.headers.setdefault(k,v)
+    return resp
 
-    resp = StreamingResponse(eventgen(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    })
-    return add_cors_headers(resp)
-
-routes = [
-    Route("/", preflight, methods=["OPTIONS"]),     # CORS preflight
-    Route("/", proxy_post_root, methods=["POST"]),  # JSON-RPC
+app = Starlette(routes=[
+    Route("/", preflight, methods=["OPTIONS"]),
+    Route("/", proxy_post_root, methods=["POST"]),
     Route("/sse", preflight, methods=["OPTIONS"]),
-    Route("/sse", proxy_sse, methods=["GET"]),      # SSE
-]
-app = Starlette(routes=routes)
+    Route("/sse", proxy_sse, methods=["GET"]),
+])
 
-if __name__ == "__main__":
-    # Para correr local:
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PUBLIC_PORT, reload=False)
+# Run: uvicorn server_proxy_stateless:app --host 0.0.0.0 --port $PORT
